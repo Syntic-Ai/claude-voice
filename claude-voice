@@ -1,0 +1,4 @@
+#!/bin/sh
+# Hands-free continuous voice mode for Claude Code. Args pass through to `claude`.
+DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+exec "$DIR/.venv/bin/python" "$DIR/claude_voice.py" "$@"

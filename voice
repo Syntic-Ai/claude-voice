@@ -1,0 +1,24 @@
+#!/bin/sh
+# Control claude-voice from inside Claude Code: type  ! voice off   (the ! runs it instantly, no tokens used)
+#   voice off | on          stop / start listening (mic)        voice speak off | on   mute / unmute spoken replies
+#   voice mute | unmute     same as speak off / on               voice status
+DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+ctl() {
+  if [ -n "$CLAUDE_VOICE_CTL" ]; then printf '%s\n' "$1" >> "$CLAUDE_VOICE_CTL"
+  else echo "(not inside a claude-voice session — mic setting unchanged)"; fi
+}
+speak() {
+  if [ "$1" = on ]; then rm -f "$DIR/speak-off"; else touch "$DIR/speak-off"; pkill -x say; pkill -f 'afplay.*claude-tts'; fi 2>/dev/null
+  [ -n "$CLAUDE_VOICE_CTL" ] && printf 'speak-changed\n' >> "$CLAUDE_VOICE_CTL"
+  echo "spoken replies: $1"
+}
+case "$1 $2" in
+  "off "|"listen off"|"mic off") ctl listen-off; echo "listening: off" ;;
+  "on "|"listen on"|"mic on")    ctl listen-on;  echo "listening: on" ;;
+  "speak off"|"mute "|"quiet ")  speak off ;;
+  "speak on"|"unmute ")          speak on ;;
+  "status "|" ")
+    [ -n "$CLAUDE_VOICE_STATUS" ] && cat "$CLAUDE_VOICE_STATUS" && echo || echo "not inside a claude-voice session"
+    [ -f "$DIR/speak-off" ] && echo "spoken replies: off" || echo "spoken replies: on" ;;
+  *) sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

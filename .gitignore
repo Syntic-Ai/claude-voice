@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+run/
+speak-off
+config.json
+tests/last_screen.txt
+.DS_Store
