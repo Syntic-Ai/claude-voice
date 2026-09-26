@@ -1,11 +1,21 @@
 # claude-voice
 
+<p align="center"><img src="assets/social-preview.png" alt="claude-voice: talk to Claude Code from bed, never touch the keyboard" width="820"></p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
+  <img alt="macOS" src="https://img.shields.io/badge/platform-macOS-lightgrey">
+  <img alt="local" src="https://img.shields.io/badge/speech-100%25%20local-success">
+  <img alt="no API keys" src="https://img.shields.io/badge/API%20keys-none-success">
+  <a href="https://github.com/Syntic-Ai/claude-voice/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/Syntic-Ai/claude-voice?style=social"></a>
+</p>
+
 **Hands-free, always-listening voice mode for [Claude Code](https://docs.claude.com/en/docs/claude-code).**
 Talk to Claude from across the room and never touch the keyboard: no push-to-talk, no Space bar, no Enter.
 Say **"go go"** (or your own word) to send, answer Claude's permission prompts and questions out loud,
 and Claude answers out loud too.
 
-> Unofficial community tool. Not affiliated with or endorsed by Anthropic.
+<!-- DEMO VIDEO: drag the .mp4 into this README on github.com to embed it here -->
 
 ```
 LISTEN → you speak → "…go go" (or 10 s of quiet) → TRANSCRIBE (local) → TYPE → SUBMIT
@@ -13,9 +23,21 @@ LISTEN → you speak → "…go go" (or 10 s of quiet) → TRANSCRIBE (local) �
       → Claude speaks its answer → LISTEN
 ```
 
-Claude Code's built-in `/voice` is push-to-talk (hold Space) or tap-to-toggle. `claude-voice` runs the real
-`claude` inside a pseudo-terminal and adds a continuous loop around it. Plain `claude` and its `/voice` keep
-working exactly as before.
+> Unofficial community tool. Not affiliated with or endorsed by Anthropic.
+
+### Why
+
+| | Claude Code `/voice` | **claude-voice** |
+|---|---|---|
+| Start talking | hold or tap **Space** | just talk, it's always listening |
+| Send | release / tap **Space** | say **"go go"** (your word) or pause |
+| Permission prompts & questions | keyboard | say **"yes"**, **"always"**, **"option two"**, **"green"** |
+| Stop Claude mid-task | **Esc** | say **"stop"** |
+| Claude's reply | text | text **and spoken aloud** |
+| Works from across the room | no | yes (tested at 1/10 volume) |
+| Your normal Claude Code | ✓ | ✓ same `claude`, same UI, all flags pass through |
+
+Built for coding from the couch or bed, long sessions without RSI flare-ups, and anyone who can't or would rather not type.
 
 ## Install (macOS)
 
@@ -78,10 +100,13 @@ drafts (`📝 12 words …`), queued messages, and `🔈`/`🔇`.
 
 ## Safety
 
-- **Never submits while you're speaking.** Voice-activity detection plus an energy gate; a message ends only after
-  `silenceMs` of silence (default 10 s, so thinking pauses don't cut you off). Coughs, clicks and short noises are ignored.
+- **Never submits while you're speaking.** Voice-activity detection plus an energy gate; a message ends only on your
+  send word or after `silenceMs` of silence (default 10 s, so thinking pauses don't cut you off). Coughs, clicks and
+  short noises are ignored.
 - **Only types when Claude is ready.** Claude Code hooks report `idle` / `busy` / `waiting`. Speech while Claude works is
-  queued and sent when it finishes. Nothing is ever typed into permission prompts, questions, or startup dialogs.
+  queued and sent when it finishes. Dialogs only ever receive key presses from a small fixed set of spoken answers
+  ("yes", "no", "option two", an option's name). Your words are never typed into a dialog, and nothing reaches
+  startup dialogs.
 - **No echo.** The mic is muted while Claude's reply is being spoken, so it never hears itself.
 - **Keyboard still works.** Typing pauses voice injection for a moment so you never collide.
 - **Everything is scoped.** Hooks and status line are no-ops outside `claude-voice` sessions.
@@ -146,6 +171,25 @@ See `DEFAULTS` in `claude_voice.py` for every option.
 ```sh
 ~/claude-voice/uninstall.sh && rm -rf ~/claude-voice
 ```
+
+## FAQ
+
+**Does audio leave my machine?** No. Speech detection and transcription (faster-whisper) run locally.
+Only the resulting text goes to Claude, exactly as if you typed it.
+
+**How is this different from [VoiceMode](https://github.com/mbailey/voicemode)?** VoiceMode is an MCP server: Claude
+calls a `converse` tool to listen and speak, so the model drives the conversation. claude-voice wraps the terminal
+itself: the mic is always on, you drive, and it works with Claude Code's normal interface, including answering
+permission prompts and questions by voice. Different approaches; use whichever fits.
+
+**Will it send things I didn't mean to?** With the default `both` mode, anything you say is sent after 10 s of quiet.
+Use `submitMode: "word"` so only your send word sends, say "scratch that" to drop a draft, or "voice off" to sleep.
+
+**Background TV / other people?** Always-on means they'd be heard too. Say "voice off" (only "voice on" wakes it),
+press F8 for a hard mic-off, or raise `vadAggressiveness`.
+
+**Linux / Windows?** macOS is what's built and tested. Linux likely needs small changes (TTS and sound commands);
+PRs welcome.
 
 ## License
 
