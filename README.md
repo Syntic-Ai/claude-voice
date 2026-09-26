@@ -1,14 +1,16 @@
 # claude-voice
 
 **Hands-free, always-listening voice mode for [Claude Code](https://docs.claude.com/en/docs/claude-code).**
-Talk to Claude from across the room — no push-to-talk, no Space bar, no Enter. Stop talking and it sends.
-Claude answers out loud.
+Talk to Claude from across the room and never touch the keyboard: no push-to-talk, no Space bar, no Enter.
+Say **"go go"** (or your own word) to send, answer Claude's permission prompts and questions out loud,
+and Claude answers out loud too.
 
 > Unofficial community tool. Not affiliated with or endorsed by Anthropic.
 
 ```
-LISTEN → you speak → RECORD → you go quiet (10 s) → TRANSCRIBE (local) → TYPE → SUBMIT
-      → Claude works (anything you say meanwhile is queued) → Claude speaks its answer → LISTEN
+LISTEN → you speak → "…go go" (or 10 s of quiet) → TRANSCRIBE (local) → TYPE → SUBMIT
+      → Claude works (anything you say meanwhile is queued) → "Allow this command?" → you: "yes"
+      → Claude speaks its answer → LISTEN
 ```
 
 Claude Code's built-in `/voice` is push-to-talk (hold Space) or tap-to-toggle. `claude-voice` runs the real
@@ -32,17 +34,47 @@ All speech recognition runs **locally** (faster-whisper) — no audio leaves you
 
 Run `claude-voice` instead of `claude`. All arguments pass through (`claude-voice --continue`, `claude-voice --model opus`, …).
 
-| | Say | Key | Type in Claude |
-|---|---|---|---|
-| Stop listening (mic fully closed) | "voice off" | F8 | `! voice off` |
-| Start listening | — | F8 | `! voice on` |
-| Mute Claude's spoken replies | "stop talking" | F9 | `! voice mute` |
-| Unmute | "talk to me" | F9 | `! voice unmute` |
-| Drop queued messages | "scratch that" | — | — |
-| Show state | — | — | `! voice status` |
+### Sending
 
-The `!` prefix runs the command instantly without using a model turn. `claude-voice --voice-off` starts muted.
-The status line shows `🎙 listening` / `🔴 recording` / `✍️ transcribing` / `⏸ voice off` and `🔈`/`🔇`.
+End what you say with a **send word**: *"Check the rooftop playground again, **go go**."* It's sent about 2 seconds
+after you stop. Defaults: **go go**, **finish**, **do it**, **send it**. Or just go quiet for 10 seconds.
+
+| `submitMode` | Sends when… | Good for |
+|---|---|---|
+| `both` (default) | you say a send word, **or** after 10 s of quiet | most people |
+| `word` | **only** a send word. Pauses never send; everything is collected into one message | long, thoughtful dictation |
+| `silence` | only after `silenceMs` of quiet | when you don't want to say a word |
+
+### Everything by voice
+
+| | Say |
+|---|---|
+| Send now | "…**go go**" / "…**finish**" / "…**do it**" / "…**send it**" (or your own) |
+| Answer a permission prompt | "**yes**" · "**always**" (don't ask again) · "**no**" · "**no, use pnpm instead**" (rejects and sends the rest) |
+| Answer Claude's question | the option's name (**"green"**), or "**option two**" / "**the second one**" · "**skip**" |
+| Stop Claude mid-task (Esc) | "**stop**" / "**interrupt**" |
+| Drop what's queued/drafted | "**scratch that**" |
+| Pause listening | "**voice off**": sleeps until you say "**voice on**" / "**wake up**" (nothing else gets through) |
+| Mute / unmute Claude's voice | "**stop talking**" / "**talk to me**" |
+| Change your send word | "**set send word to** banana" / "**add send word** banana" |
+
+Answers are only matched while a dialog is actually open, and only turn into key presses. Speech is never typed into a dialog.
+
+### Keys and commands (optional)
+
+| | Key | Type in Claude (`!` runs it instantly, no tokens) |
+|---|---|---|
+| Mic fully off / on | F8 | `! voice off` · `! voice on` |
+| Spoken replies off / on | F9 | `! voice mute` · `! voice unmute` |
+| Set send words | | `! voice send-words "go go" finish` |
+| Submit mode | | `! voice submit word` · `silence` · `both` |
+| Silence before sending | | `! voice silence 10` (seconds) |
+| Names to spell right | | `! voice vocab Syntic "Camila Live" Kubernetes` |
+| Show settings / state | | `! voice settings` · `! voice status` |
+
+Settings apply immediately, with no restart. `claude-voice --voice-off` starts muted.
+The status line shows `🎙 listening` / `🔴 recording` / `✍️ transcribing` / `💤 asleep` / `⏸ voice off`,
+drafts (`📝 12 words …`), queued messages, and `🔈`/`🔇`.
 
 ## Safety
 
@@ -59,14 +91,16 @@ or raise `vadAggressiveness`.
 
 ## Configure
 
-Create `config.json` next to `claude_voice.py` with any overrides (defaults shown):
+Use the `voice` commands above, or edit `config.json` next to `claude_voice.py` (only the keys you change; defaults shown):
 
 ```json
 {
+  "submitMode": "both",
+  "sendPhrases": ["go go", "finish", "do it", "send it"],
   "silenceMs": 10000,
+  "vocabulary": [],
   "model": "small.en",
   "vadAggressiveness": 2,
-  "minSpeechMs": 400,
   "whileBusy": "queue",
   "speakReplies": true,
   "sounds": true,
@@ -76,6 +110,8 @@ Create `config.json` next to `claude_voice.py` with any overrides (defaults show
 }
 ```
 
+- `sendPhrases` — pick words you won't naturally end a sentence with. The send word is removed from the message.
+- `vocabulary` — names Whisper would otherwise mishear (without it, "Syntic and SynteraX" came out as "Cintiq and Cintarax").
 - `silenceMs` — quiet time before sending (1000–2000 feels conversational; 10000 suits dictating from across the room).
 - `model` — `tiny.en` / `base.en` (faster) … `medium.en` (more accurate). Other languages: `small` + `"language": "de"` etc.
 - `vadAggressiveness` — 0–3; 3 = strictest (noisy rooms).
@@ -89,7 +125,7 @@ See `DEFAULTS` in `claude_voice.py` for every option.
 | Piece | File |
 |---|---|
 | PTY wrapper, mic capture, VAD/end-of-speech, Whisper, injection | `claude_voice.py` |
-| State hooks (SessionStart/Stop → idle, UserPromptSubmit → busy, PermissionRequest/AskUserQuestion → waiting) | `hook.sh` |
+| State hooks (SessionStart/Stop → idle, UserPromptSubmit → busy, PermissionRequest → waiting-permission, AskUserQuestion → waiting-question + its options) | `hook.sh` |
 | Reads the reply's `🔊` line aloud (Claude is asked to end replies with one) | `speak.py` |
 | Voice state in the status line | `statusline.sh` |
 | `voice` control command | `voice` |
@@ -100,7 +136,9 @@ See `DEFAULTS` in `claude_voice.py` for every option.
 ```sh
 .venv/bin/python tests/test_pipeline.py   # synthesized speech + noise → VAD → Whisper
 .venv/bin/python tests/test_commands.py   # queueing, voice commands, controls
+.venv/bin/python tests/test_voice_features.py  # send words, word mode, sleep/wake, interrupt, dialog answers, vocabulary
 .venv/bin/python tests/test_e2e.py        # real claude, spoken input, zero keypresses (uses a little usage)
+.venv/bin/python tests/test_e2e_dialogs.py  # real claude: "go go", permission "yes", question "green", all by voice
 ```
 
 ## Uninstall

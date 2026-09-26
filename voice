@@ -1,8 +1,11 @@
 #!/bin/sh
-# Control claude-voice from inside Claude Code: type  ! voice off   (the ! runs it instantly, no tokens used)
-#   voice off | on          stop / start listening (mic)        voice speak off | on   mute / unmute spoken replies
-#   voice mute | unmute     same as speak off / on               voice status
+# Control claude-voice from inside Claude Code — type with the ! prefix (runs instantly, no tokens used):
+#   ! voice off | on                  stop / start listening          ! voice mute | unmute    spoken replies off / on
+#   ! voice send-words "go go" finish set your send words             ! voice submit word|silence|both
+#   ! voice silence 10                seconds of quiet before sending ! voice vocab Syntic "Camila Live"   names to spell right
+#   ! voice settings                  show all settings               ! voice status
 DIR=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+PY="$DIR/.venv/bin/python"
 ctl() {
   if [ -n "$CLAUDE_VOICE_CTL" ]; then printf '%s\n' "$1" >> "$CLAUDE_VOICE_CTL"
   else echo "(not inside a claude-voice session — mic setting unchanged)"; fi
@@ -12,13 +15,22 @@ speak() {
   [ -n "$CLAUDE_VOICE_CTL" ] && printf 'speak-changed\n' >> "$CLAUDE_VOICE_CTL"
   echo "spoken replies: $1"
 }
-case "$1 $2" in
-  "off "|"listen off"|"mic off") ctl listen-off; echo "listening: off" ;;
-  "on "|"listen on"|"mic on")    ctl listen-on;  echo "listening: on" ;;
-  "speak off"|"mute "|"quiet ")  speak off ;;
-  "speak on"|"unmute ")          speak on ;;
-  "status "|" ")
+setting() { "$PY" "$DIR/claude_voice.py" --set "$@"; }
+cmd="$1"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  off|listen-off|mic-off) ctl listen-off; echo "listening: off" ;;
+  on|listen-on|mic-on)    ctl listen-on;  echo "listening: on" ;;
+  mute|quiet)             speak off ;;
+  unmute)                 speak on ;;
+  speak)                  speak "${1:-on}" ;;
+  send-words|send-word|words) setting sendPhrases "$@" ;;
+  submit|mode)            setting submitMode "$@" ;;
+  silence)                setting silenceMs "$@" ;;
+  vocab|vocabulary)       setting vocabulary "$@" ;;
+  set)                    setting "$@" ;;
+  settings|config)        setting ;;
+  status|"")
     [ -n "$CLAUDE_VOICE_STATUS" ] && cat "$CLAUDE_VOICE_STATUS" && echo || echo "not inside a claude-voice session"
     [ -f "$DIR/speak-off" ] && echo "spoken replies: off" || echo "spoken replies: on" ;;
-  *) sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//' ;;
 esac

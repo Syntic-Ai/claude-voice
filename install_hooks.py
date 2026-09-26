@@ -21,8 +21,8 @@ ENTRIES = [
     ("SessionStart", None, f"{HOOK} idle"),
     ("Stop", None, f"{HOOK} idle"),
     ("UserPromptSubmit", None, f"{HOOK} busy"),
-    ("PermissionRequest", None, f"{HOOK} waiting"),
-    ("PreToolUse", "AskUserQuestion", f"{HOOK} waiting"),
+    ("PermissionRequest", None, f"{HOOK} waiting-permission"),
+    ("PreToolUse", "AskUserQuestion", f"{HOOK} waiting-question"),
     ("PostToolUse", "AskUserQuestion", f"{HOOK} busy"),
 ]
 

@@ -3,6 +3,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 import claude_voice as cv
 cv.RUN_DIR = tempfile.mkdtemp()
+os.environ["CLAUDE_VOICE_CONFIG"] = os.path.join(cv.RUN_DIR, "cfg.json")
 class FakeListener:
     enabled = True
     def stop(self): self.enabled = False
@@ -12,7 +13,9 @@ s.state.write("busy")
 s.handle_text("Now test the horses."); s.handle_text("And the rooftop.")
 assert list(s.pending) == ["Now test the horses.", "And the rooftop."]      # queued while busy
 s.handle_text("Scratch that."); assert not s.pending                           # cancel phrase
-s.handle_text("Voice off."); assert s.listener.enabled is False                # stop phrase
+s.handle_text("Voice off."); assert s.sleeping and s.listener.enabled         # spoken stop = sleep (wake word only)
+s.handle_text("Delete everything"); assert not s.pending                        # ignored while asleep
+s.sleeping = False
 s2 = cv.VoiceSession(dict(cv.load_config(), sounds=False, whileBusy="ignore"), []); s2.listener = FakeListener()
 s2.state.write("busy"); s2.handle_text("dropped"); assert not s2.pending          # ignore mode
 assert s2.state.value == "busy"

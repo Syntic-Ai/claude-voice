@@ -79,7 +79,14 @@ DEFAULTS = {
     "speakToggleKey": "f9",
     "muteSpeechPhrases": ["stop talking", "be quiet", "mute voice", "speech off"],
     "unmuteSpeechPhrases": ["start talking", "talk to me", "speech on"],
-    "stopPhrases": ["voice off", "stop listening", "voice mode off"],
+    "stopPhrases": ["voice off", "stop listening", "voice mode off", "go to sleep"],   # spoken: sleep (wake word only)
+    "wakePhrases": ["voice on", "wake up", "start listening", "voice mode on"],
+    "submitMode": "both",          # "silence": send after silenceMs · "word": only a send phrase sends · "both"
+    "sendPhrases": ["go go", "finish", "do it", "send it"],   # say one at the end to submit at once (pick words you won't end sentences with)
+    "draftPauseMs": 1500,          # word mode: pause that closes a chunk of the draft (not a send)
+    "interruptPhrases": ["stop", "stop that", "stop claude", "interrupt", "abort"],  # while Claude works = Esc
+    "peekMs": 900,                 # after a pause this long, check for commands / "send it" / dialog answers
+    "vocabulary": [],              # names Whisper should spell right, e.g. ["Syntic", "SynteraX", "Kubernetes"]
     "cancelPhrases": ["cancel that", "scratch that", "never mind that"],
     "inputDevice": None,           # sounddevice device name/index, None = system default
     "claudeCommand": "claude",
@@ -104,12 +111,40 @@ FRAME_MS = 30
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
 
 
-def load_config(path: str = os.environ.get("CLAUDE_VOICE_CONFIG", CONFIG_PATH)) -> dict:
+def config_path() -> str:
+    return os.environ.get("CLAUDE_VOICE_CONFIG", CONFIG_PATH)
+
+
+def load_config(path: str | None = None) -> dict:
     cfg = dict(DEFAULTS)
+    path = path or config_path()
     if os.path.exists(path):
         with open(path) as f:
             cfg.update(json.load(f))
     return cfg
+
+
+def config_mtime() -> float:
+    try:
+        return os.stat(config_path()).st_mtime
+    except FileNotFoundError:
+        return 0.0
+
+
+def update_config(cfg: dict | None = None, **changes) -> dict:
+    """Persist changes to config.json (only the keys the user set) and apply them to a live cfg."""
+    path = config_path()
+    saved = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            saved = json.load(f)
+    saved.update(changes)
+    with open(path, "w") as f:
+        json.dump(saved, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    if cfg is not None:
+        cfg.update(changes)
+    return saved
 
 
 # ─── End-of-speech segmentation ──────────────────────────────────────────────
@@ -125,6 +160,7 @@ class Segmenter:
         self.start_n = max(1, cfg["startWindowMs"] // FRAME_MS)
         self.pre = deque(maxlen=max(self.start_n, cfg["preRollMs"] // FRAME_MS))
         self.window = deque(maxlen=self.start_n)
+        self.utt_id = 0
         self.reset()
 
     def reset(self):
@@ -134,6 +170,8 @@ class Segmenter:
         self.silence_ms = 0
         self.pre.clear()
         self.window.clear()
+        self.peek_done = False
+        self.peek: tuple[int, bytes] | None = None
 
     def voiced(self, frame: bytes) -> bool:
         samples = np.frombuffer(frame, dtype=np.int16).astype(np.float32) / 32768.0
@@ -147,6 +185,7 @@ class Segmenter:
             self.window.append(v)
             if len(self.window) == self.start_n and sum(self.window) >= self.cfg["startRatio"] * self.start_n:
                 self.in_speech = True
+                self.utt_id += 1
                 self.frames = list(self.pre)
                 self.voiced_ms = sum(self.window) * FRAME_MS
                 self.silence_ms = 0
@@ -155,17 +194,39 @@ class Segmenter:
         if v:
             self.voiced_ms += FRAME_MS
             self.silence_ms = 0
+            self.peek_done = False
         else:
             self.silence_ms += FRAME_MS
+            if not self.peek_done and self.silence_ms >= self.cfg["peekMs"]:
+                self.peek_done = True
+                self.peek = (self.utt_id, self._trimmed())
         too_long = len(self.frames) * FRAME_MS >= self.cfg["maxUtteranceSec"] * 1000
-        if self.silence_ms >= self.cfg["silenceMs"] or too_long:
-            keep_tail = 200 // FRAME_MS
-            drop = max(0, self.silence_ms // FRAME_MS - keep_tail)
-            frames = self.frames[: len(self.frames) - drop] if drop else self.frames
-            enough = self.voiced_ms >= self.cfg["minSpeechMs"]
+        end_ms = self.cfg["draftPauseMs"] if self.cfg["submitMode"] == "word" else self.cfg["silenceMs"]
+        if self.silence_ms >= end_ms or too_long:
+            audio, enough = self._trimmed(), self.voiced_ms >= self.cfg["minSpeechMs"]
             self.reset()
-            return b"".join(frames) if enough else None
+            return audio if enough else None
         return None
+
+    def _trimmed(self) -> bytes:
+        drop = max(0, self.silence_ms // FRAME_MS - 200 // FRAME_MS)
+        return b"".join(self.frames[: len(self.frames) - drop] if drop else self.frames)
+
+    def take_peek(self) -> tuple[int, bytes] | None:
+        p, self.peek = self.peek, None
+        return p
+
+    def still_paused(self, utt_id: int) -> bool:
+        """True while the utterance a peek came from is unchanged (no new speech since)."""
+        return self.in_speech and self.utt_id == utt_id and self.peek_done
+
+    def force_end(self, utt_id: int) -> bytes | None:
+        """End the current utterance now (after a peek decided it's complete)."""
+        if not self.still_paused(utt_id):
+            return None
+        audio = self._trimmed()
+        self.reset()
+        return audio
 
     @property
     def recording(self) -> bool:
@@ -180,11 +241,13 @@ class Transcriber:
         self.cfg = cfg
         self.model = WhisperModel(cfg["model"], device="cpu", compute_type="int8")
 
-    def transcribe(self, pcm16: bytes) -> str:
+    def transcribe(self, pcm16: bytes, fast: bool = False) -> str:
         audio = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
+        vocab = self.cfg.get("vocabulary") or []
         segments, _ = self.model.transcribe(
-            audio, language=self.cfg["language"], beam_size=5,
+            audio, language=self.cfg["language"], beam_size=1 if fast else 5,
             condition_on_previous_text=False, vad_filter=False,
+            initial_prompt=("Glossary: " + ", ".join(vocab) + ".") if vocab else None,
         )
         parts = [s.text for s in segments
                  if not (s.no_speech_prob > 0.6 and s.avg_logprob < -1.0)]
@@ -200,7 +263,29 @@ def clean_transcript(text: str) -> str:
 
 
 def normalize(text: str) -> str:
-    return re.sub(r"[^a-z ]", "", text.lower()).strip()
+    text = re.sub(r"[-_/]", " ", text.lower())
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", "", text)).strip()
+
+
+YES_WORDS = ["yes", "yeah", "yep", "yup", "sure", "ok", "okay", "approve", "approved", "allow", "allow it",
+             "do it", "go ahead", "yes please", "proceed", "confirm", "accept"]
+ALWAYS_WORDS = ["always", "yes always", "always allow", "yes and dont ask again", "dont ask again",
+                "yes dont ask again", "allow always"]
+NO_WORDS = ["no", "nope", "deny", "denied", "reject", "cancel", "dont", "no thanks", "decline"]
+_NUMS = {"one": 1, "first": 1, "1": 1, "two": 2, "to": 2, "too": 2, "second": 2, "2": 2,
+         "three": 3, "third": 3, "3": 3, "four": 4, "for": 4, "fourth": 4, "4": 4, "five": 5, "fifth": 5,
+         "5": 5, "six": 6, "sixth": 6, "6": 6, "seven": 7, "seventh": 7, "7": 7, "eight": 8, "eighth": 8,
+         "8": 8, "nine": 9, "ninth": 9, "9": 9}
+
+
+def spoken_index(n: str) -> int | None:
+    """'option two' / 'number 3' / 'the second one' / '2' -> zero-based index."""
+    m = (re.fullmatch(r"(?:option|number|choice|choose|pick|select)(?: number)? (\w+)", n)
+         or re.fullmatch(r"(?:the )?(\w+)(?: one| option)", n)
+         or re.fullmatch(r"(\d)", n))
+    if m and m.group(1) in _NUMS:
+        return _NUMS[m.group(1)] - 1
+    return None
 
 
 # ─── Session state (fed by hooks) ────────────────────────────────────────────
@@ -238,7 +323,7 @@ class SessionState:
             pass
         now = time.monotonic()
         # A key pressed in a permission dialog means the user handled it.
-        if self.value == "waiting" and last_key > self.since:
+        if self.value.startswith("waiting") and last_key > self.since:
             self._set("busy")
         # Esc-interrupts don't fire Stop; the spinner stops redrawing, so go idle on quiet.
         quiet = self.cfg["quietIdleMs"] / 1000
@@ -250,9 +335,11 @@ class SessionState:
 # ─── Microphone listener ─────────────────────────────────────────────────────
 
 class Listener:
-    def __init__(self, cfg: dict, on_event):
+    def __init__(self, cfg: dict, on_event, decide=None):
         self.cfg = cfg
         self.on_event = on_event          # callback(kind, payload)
+        self.decide = decide or (lambda text, whole: None)   # peek verdict: "finish" | "consume" | None
+        self._seg_lock = threading.Lock()
         self.enabled = False
         self.frames: queue.Queue = queue.Queue()
         self.utterances: queue.Queue = queue.Queue()
@@ -285,10 +372,24 @@ class Listener:
             import wave
 
             def feed():
-                with wave.open(test_wav) as w:
-                    while (chunk := w.readframes(FRAME_SAMPLES)):
-                        self.frames.put(chunk)
+                clips = [test_wav] if os.path.isfile(test_wav) else []
+                quiet = b"\0" * FRAME_SAMPLES * 2
+                while True:        # a directory is a spool: tests drop .wav clips in; silence in between
+                    if not clips and os.path.isdir(test_wav):
+                        clips = sorted(os.path.join(test_wav, f) for f in os.listdir(test_wav) if f.endswith(".wav"))
+                    if not clips:
+                        if not os.path.isdir(test_wav):
+                            return
+                        self.frames.put(quiet)
                         time.sleep(FRAME_MS / 1000)
+                        continue
+                    with wave.open(clips[0]) as w:
+                        while (chunk := w.readframes(FRAME_SAMPLES)):
+                            self.frames.put(chunk)
+                            time.sleep(FRAME_MS / 1000)
+                    if os.path.isdir(test_wav):
+                        os.remove(clips[0])
+                    clips.pop(0)
             self.enabled = True
             threading.Thread(target=feed, daemon=True).start()
             self.on_event("status", "listening")
@@ -341,7 +442,11 @@ class Listener:
             buf = frame
             while len(buf) >= FRAME_SAMPLES * 2:
                 fr, buf = buf[: FRAME_SAMPLES * 2], buf[FRAME_SAMPLES * 2:]
-                utt = self.segmenter.feed(fr)
+                with self._seg_lock:
+                    utt = self.segmenter.feed(fr)
+                    peek = self.segmenter.take_peek()
+                if peek is not None:
+                    self.utterances.put(("peek", *peek))
                 if self.segmenter.recording and not was_recording:
                     was_recording = True
                     self.on_event("status", "recording")
@@ -349,15 +454,22 @@ class Listener:
                     was_recording = False
                     self.on_event("status", "listening")
                 if utt is not None:
-                    self.utterances.put(utt)
+                    self.utterances.put(("final", 0, utt))
+
+    PEEK_WHOLE_SEC = 6     # peeks shorter than this are transcribed whole (commands, answers)
+    PEEK_TAIL_SEC = 3      # longer ones: only the tail, to spot "send it"
 
     def _transcribe_loop(self):
         while True:
-            utt = self.utterances.get()
+            kind, utt_id, utt = self.utterances.get()
             while self.transcriber is None:
                 time.sleep(0.2)
-            self.on_event("status", "transcribing")
             try:
+                if kind == "peek":
+                    utt = self._peek(utt_id, utt)
+                    if utt is None:
+                        continue
+                self.on_event("status", "transcribing")
                 text = self.transcriber.transcribe(utt)
             except Exception as e:  # noqa: BLE001
                 self.on_event("error", f"transcription failed: {e}")
@@ -365,6 +477,44 @@ class Listener:
             self.on_event("status", "listening" if self.enabled else "off")
             if text:
                 self.on_event("text", text)
+
+    def _peek(self, utt_id: int, audio: bytes) -> bytes | None:
+        """Quick look at a paused utterance. Returns full audio to transcribe now, or None."""
+        with self._seg_lock:
+            if not self.segmenter.still_paused(utt_id):
+                return None                          # speaker carried on, or it already ended
+        whole = len(audio) <= self.PEEK_WHOLE_SEC * SAMPLE_RATE * 2
+        clip = audio if whole else audio[-self.PEEK_TAIL_SEC * SAMPLE_RATE * 2:]
+        text = self.transcriber.transcribe(clip, fast=True)
+        verdict = self.decide(text, whole)
+        if verdict is None:
+            return None
+        with self._seg_lock:
+            full = self.segmenter.force_end(utt_id)
+        if full is None:
+            return None
+        self.on_event("status", "listening")
+        if verdict == "finish" and whole:
+            self.on_event("text", text)          # short message: the peek already heard all of it
+            return None
+        return full if verdict == "finish" else None
+
+
+def clean_stale_run_files():
+    """Remove state files left behind by sessions that were killed."""
+    for name in os.listdir(RUN_DIR):
+        pid = name.split(".", 1)[0]
+        if not pid.isdigit():
+            continue
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            try:
+                os.remove(os.path.join(RUN_DIR, name))
+            except OSError:
+                pass
+        except PermissionError:
+            pass
 
 
 # ─── PTY wrapper around claude ───────────────────────────────────────────────
@@ -374,6 +524,7 @@ class VoiceSession:
         self.cfg = cfg
         self.args = claude_args
         os.makedirs(RUN_DIR, exist_ok=True)
+        clean_stale_run_files()
         pid = os.getpid()
         self.state_path = os.path.join(RUN_DIR, f"{pid}.state")
         self.status_path = os.path.join(RUN_DIR, f"{pid}.status")
@@ -390,6 +541,12 @@ class VoiceSession:
         self.enter_at: float | None = None
         self.status = "starting"
         self.listener: Listener | None = None
+        self.sleeping = False                      # spoken "voice off": only the wake phrase is accepted
+        self.keyq: deque[bytes] = deque()          # keys for dialog answers, sent one at a time
+        self.key_at = 0.0
+        self.question_index = 0
+        self.draft: list[str] = []                 # word mode: text collected until the send phrase
+        self._cfg_mtime = config_mtime()
 
     # events arrive from listener threads; handled on the main loop
     def on_event(self, kind: str, payload: str):
@@ -397,9 +554,16 @@ class VoiceSession:
 
     def set_status(self, s: str):
         self.status = s
+        if self.sleeping and s == "listening":
+            s = "asleep"
         q = f" · {len(self.pending)} queued" if self.pending else ""
+        if self.draft:
+            words = " ".join(self.draft).split()
+            q += f" · 📝 {len(words)} words …{' '.join(words[-4:])}"
+        if self.cfg["submitMode"] != "silence":
+            q += f' · say "{self.cfg["sendPhrases"][0]}" to send' if self.cfg["sendPhrases"] else ""
         icon = {"listening": "🎙 listening", "recording": "🔴 recording", "transcribing": "✍️  transcribing",
-                "off": "⏸  voice off", "loading model": "⏳ loading speech model"}.get(s, s)
+                "off": "⏸  voice off", "asleep": "💤 asleep, say 'voice on'", "loading model": "⏳ loading speech model"}.get(s, s)
         spk = "🔈 speaking" if speaking() else "🔇 muted"
         keys = f'{self.cfg["toggleKey"].upper()} mic · {self.cfg["speakToggleKey"].upper()} speech'
         try:
@@ -414,7 +578,13 @@ class VoiceSession:
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def set_listening(self, on: bool):
-        if self.listener is None or self.listener.enabled == on:
+        if self.listener is None:
+            return
+        if on and self.sleeping:
+            self.sleeping = False
+            self.chime("Pop")
+            self.set_status(self.status)
+        if self.listener.enabled == on:
             return
         self.toggle()
 
@@ -451,22 +621,143 @@ class VoiceSession:
             self.listener.stop()
             self.chime("Bottle")
         else:
+            self.sleeping = False
             self.listener.start()
             self.chime("Pop")
 
+    # ── spoken control ──
+
+    def decide(self, text: str, whole: bool) -> str | None:
+        """Called from the transcription thread on a pause (peek). Actions go through self.events."""
+        n = normalize(text)
+        if self.sleeping:
+            if any(n == w or n.endswith(" " + w) for w in self.cfg["wakePhrases"]):
+                self.events.put(("wake", ""))
+            return "consume"                       # asleep: everything else is dropped right away
+        if not whole:
+            return "finish" if self.ends_with_send(n) else None
+        if n in self.cfg["stopPhrases"] + self.cfg["muteSpeechPhrases"] + self.cfg["unmuteSpeechPhrases"] \
+                + self.cfg["cancelPhrases"]:
+            self.events.put(("text", text))
+            return "consume"
+        if n in self.cfg["interruptPhrases"]:
+            self.events.put(("interrupt", ""))
+            return "consume"
+        if self.state.value.startswith("waiting-") and self.answer(n, dry_run=True):
+            self.events.put(("answer", n))
+            return "consume"
+        return "finish" if self.ends_with_send(n) else None
+
+    def ends_with_send(self, n: str) -> bool:
+        if self.cfg["submitMode"] == "silence":
+            return False
+        toks = n.split()
+        for p in self.cfg["sendPhrases"]:
+            want = normalize(p).replace(" ", "")      # "go go" also matches "gogo" / "Go, go!"
+            if want and any("".join(toks[-k:]) == want for k in range(1, len(p.split()) + 2)):
+                return True
+        return False
+
+    def strip_send(self, text: str) -> str:
+        for p in sorted(self.cfg["sendPhrases"], key=len, reverse=True):
+            pat = r"[\s,.;:!-]*\b" + r"[\s,.;:!-]*".join(map(re.escape, normalize(p).split())) + r"[\s.!?]*$"
+            text = re.sub(pat, "", text, flags=re.I)
+        return text.strip()
+
+    def question_options(self) -> list[str]:
+        try:
+            with open(self.state_path + ".payload") as f:
+                qs = json.load(f)["tool_input"]["questions"]
+            return [o["label"] for o in qs[min(self.question_index, len(qs) - 1)]["options"]]
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            return []
+
+    def question_count(self) -> int:
+        try:
+            with open(self.state_path + ".payload") as f:
+                return len(json.load(f)["tool_input"]["questions"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return 1
+
+    def answer(self, n: str, dry_run: bool = False) -> bool:
+        """Map a spoken answer to keys for the open permission prompt / question. Never types text."""
+        kind = self.state.value
+        keys: list[bytes] = []
+        rest = ""
+        idx = spoken_index(n)
+        if kind == "waiting-permission":
+            if n in YES_WORDS:
+                keys = [b"\r"]
+            elif n in ALWAYS_WORDS:
+                keys = [b"\x1b[B", b"\r"]
+            elif n in NO_WORDS:
+                keys = [b"\x1b"]
+            elif re.match(r"^(no|nope|dont)\b", n) and len(n.split()) > 2:
+                keys, rest = [b"\x1b"], re.sub(r"^(no|nope|dont)\s*", "", n)   # "no, use pnpm instead"
+            elif idx is not None:
+                keys = [b"\x1b[B"] * idx + [b"\r"]
+        elif kind == "waiting-question":
+            labels = [normalize(o) for o in self.question_options()]
+            if self.question_index >= self.question_count() and n in YES_WORDS + ["submit", "submit answers"]:
+                keys = [b"\r"]                                    # multi-question review screen
+            elif n in labels:
+                keys = [b"\x1b[B"] * labels.index(n) + [b"\r"]
+            elif idx is not None and (not labels or idx < len(labels) + 1):
+                keys = [b"\x1b[B"] * idx + [b"\r"]
+            elif n in NO_WORDS + ["skip", "skip it"]:
+                keys = [b"\x1b"]
+            else:
+                hits = [i for i, l in enumerate(labels) if l and (l in n or n in l)]
+                if len(hits) == 1:
+                    keys = [b"\x1b[B"] * hits[0] + [b"\r"]
+        if not keys or dry_run:
+            return bool(keys)
+        self.keyq.extend(keys)
+        if kind == "waiting-question" and keys != [b"\x1b"]:
+            self.question_index += 1
+            if self.question_index < self.question_count():
+                return True                                         # still in the question dialog
+        self.question_index = 0
+        self.state.write("busy")
+        if rest:
+            self.pending.append(rest)
+        return True
+
     def handle_text(self, text: str):
         n = normalize(text)
+        if self.sleeping:
+            return
         if n in self.cfg["muteSpeechPhrases"] or n in self.cfg["unmuteSpeechPhrases"]:
             self.toggle_speaking(n in self.cfg["unmuteSpeechPhrases"])
             return
         if n in self.cfg["stopPhrases"]:
-            self.listener.stop()
+            self.sleeping = True
             self.chime("Bottle")
+            self.set_status(self.status)
             return
         if n in self.cfg["cancelPhrases"]:
             self.pending.clear()
+            self.draft.clear()
             self.chime("Basso")
             self.set_status(self.status)
+            return
+        m = re.fullmatch(r"(set|change|add) (?:the |my )?send (?:word|phrase) (?:to |as )?(.+)", n)
+        if m:
+            words = [] if m.group(1) != "add" else list(self.cfg["sendPhrases"])
+            update_config(self.cfg, sendPhrases=words + [m.group(2)])
+            self.chime("Glass")
+            return
+        sent = self.ends_with_send(n)
+        text = self.strip_send(text) if sent else text
+        if self.cfg["submitMode"] == "word" and not sent:
+            if text:
+                self.draft.append(text)            # keep collecting until the send phrase
+                self.chime("Tink")
+                self.set_status(self.status)
+            return
+        text = " ".join([*self.draft, text]).strip()
+        self.draft.clear()
+        if not text:
             return
         busy = self.state.value != "idle" or self.pending
         if busy and self.cfg["whileBusy"] == "ignore":
@@ -477,6 +768,11 @@ class VoiceSession:
 
     def try_inject(self, fd: int):
         now = time.monotonic()
+        if self.keyq:
+            if now >= self.key_at:
+                os.write(fd, self.keyq.popleft())
+                self.key_at = now + 0.15
+            return
         if self.enter_at is not None:
             if now >= self.enter_at:
                 os.write(fd, b"\r")
@@ -495,6 +791,30 @@ class VoiceSession:
         os.write(fd, b"\x1b[200~" + text.encode() + b"\x1b[201~")
         self.enter_at = now + 0.25
         self.set_status(self.status)
+
+    def process_events(self, fd: int):
+        """Apply listener events (status, text, wake, interrupt, answer) on the main thread."""
+        while not self.events.empty():
+            kind, payload = self.events.get_nowait()
+            if kind == "status":
+                self.set_status(payload)
+            elif kind == "text":
+                self.handle_text(payload)
+            elif kind == "wake":
+                self.sleeping = False
+                self.chime("Pop")
+                self.set_status(self.status)
+            elif kind == "interrupt":
+                self.pending.clear()
+                if self.state.value == "busy":
+                    os.write(fd, b"\x1b")          # same as pressing Esc
+                self.chime("Basso")
+                self.set_status(self.status)
+            elif kind == "answer":
+                if self.answer(payload):
+                    self.chime("Tink")
+            elif kind == "error":
+                self.set_status(f"⚠️  {payload}")
 
     def run(self) -> int:
         if self.cfg["speakReplies"]:
@@ -522,7 +842,7 @@ class VoiceSession:
             tty.setraw(stdin)
 
         self.set_status("starting")
-        self.listener = Listener(self.cfg, self.on_event)
+        self.listener = Listener(self.cfg, self.on_event, self.decide)
         if self.cfg["continuousVoice"]:
             try:
                 self.listener.start()
@@ -560,15 +880,15 @@ class VoiceSession:
                     if data:
                         self.last_key = time.monotonic()
                         os.write(fd, data)
-                while not self.events.empty():
-                    kind, payload = self.events.get_nowait()
-                    if kind == "status":
-                        self.set_status(payload)
-                    elif kind == "text":
-                        self.handle_text(payload)
-                    elif kind == "error":
-                        self.set_status(f"⚠️  {payload}")
+                self.process_events(fd)
                 self.poll_ctl()
+                if (m := config_mtime()) != self._cfg_mtime:
+                    self._cfg_mtime = m
+                    try:
+                        self.cfg.update(load_config())
+                        self.set_status(self.status)
+                    except ValueError:
+                        pass                               # half-written / invalid JSON: keep old settings
                 self.state.poll(self.last_output, self.last_key)
                 self.try_inject(fd)
         finally:
@@ -581,7 +901,7 @@ class VoiceSession:
                 code = os.waitstatus_to_exitcode(status)
             except ChildProcessError:
                 pass
-            for p in (self.state_path, self.status_path, self.ctl_path):
+            for p in (self.state_path, self.status_path, self.ctl_path, self.state_path + ".payload"):
                 try:
                     os.remove(p)
                 except OSError:
@@ -589,7 +909,44 @@ class VoiceSession:
         return code
 
 
+LIST_KEYS = {"sendPhrases", "vocabulary", "stopPhrases", "wakePhrases", "interruptPhrases", "cancelPhrases"}
+
+
+def settings_cli(args: list[str]) -> int:
+    """`voice set KEY VALUE...` / `voice settings`: edit config.json without touching JSON."""
+    if not args:
+        cfg = load_config()
+        for k in ("submitMode", "sendPhrases", "silenceMs", "vocabulary", "model", "whileBusy", "speakReplies"):
+            print(f"{k:14} {json.dumps(cfg[k], ensure_ascii=False)}")
+        print(f"\nfile: {config_path()}  (all options: DEFAULTS in claude_voice.py)")
+        return 0
+    key, vals = args[0], args[1:]
+    if key not in DEFAULTS:
+        print(f"unknown setting: {key}")
+        return 1
+    if key in LIST_KEYS:
+        value = [v for v in vals if v.strip()]
+    elif key == "submitMode":
+        if vals[:1] not in (["word"], ["silence"], ["both"]):
+            print("submit mode must be: word | silence | both")
+            return 1
+        value = vals[0]
+    elif key == "silenceMs":
+        sec = float(vals[0])
+        value = int(sec * 1000 if sec < 100 else sec)   # accept seconds (10) or ms (10000)
+    else:
+        try:
+            value = json.loads(vals[0]) if vals else None
+        except ValueError:
+            value = vals[0]
+    update_config(None, **{key: value})
+    print(f"{key} = {json.dumps(value, ensure_ascii=False)}  (applies immediately)")
+    return 0
+
+
 def main() -> int:
+    if sys.argv[1:2] == ["--set"]:
+        return settings_cli(sys.argv[2:])
     cfg = load_config()
     args = sys.argv[1:]
     if args[:1] == ["--voice-off"]:
